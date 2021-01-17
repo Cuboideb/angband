@@ -1271,14 +1271,8 @@ static status_f *status_handlers[] =
 { prt_level_feeling, prt_light, prt_moves, prt_unignore, prt_recall,
   prt_descent, prt_state, prt_study, prt_tmd, prt_dtrap, prt_terrain };
 
-
-/**
- * Print the status line.
- */
-static void update_statusline(game_event_type type, game_event_data *data, void *user)
+static void update_statusline_aux(int row, int col)
 {
-	int row = Term->hgt - 1;
-	int col = COL_MAP;
 	size_t i;
 
 	/* Clear the remainder of the line */
@@ -1287,6 +1281,24 @@ static void update_statusline(game_event_type type, game_event_data *data, void 
 	/* Display those which need redrawing */
 	for (i = 0; i < N_ELEMENTS(status_handlers); i++)
 		col += status_handlers[i](row, col);
+}
+
+/**
+ * Print the status line.
+ */
+static void update_statusline(game_event_type type, game_event_data *data, void *user)
+{
+	int row = Term->hgt - 1;
+	
+	if (Term->sidebar_mode == SIDEBAR_NONE) {		
+		return;
+	}
+
+	if (Term->sidebar_mode == SIDEBAR_TOP) {
+		row = 3;		
+	}
+
+	update_statusline_aux(row, COL_MAP);
 }
 
 
@@ -1989,6 +2001,8 @@ static void update_topbar_subwindow(game_event_type type,
 
 	update_topbar(type, data, user, 0);
 
+	update_statusline_aux(2, 0);
+
 	Term_fresh();
 	
 	/* Restore */
@@ -2175,8 +2189,15 @@ static void subwindow_flag_changed(int win_idx, u32b flag, bool new_state)
 
 		case PW_PLAYER_3:
 		{
+			// Topbar
 			set_register_or_deregister(player_events, 
 						   N_ELEMENTS(player_events),						 
+						   update_topbar_subwindow,
+						   angband_term[win_idx]);
+
+			// Also update status
+			set_register_or_deregister(statusline_events, 
+						   N_ELEMENTS(statusline_events),						 
 						   update_topbar_subwindow,
 						   angband_term[win_idx]);
 			break;
