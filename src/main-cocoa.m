@@ -2426,13 +2426,21 @@ static int compare_advances(const void *ap, const void *bp)
 {
     CGFloat tileOffsetY = self.fontAscender;
     CGFloat tileOffsetX = 0.0;
-    UniChar unicharString[2] = {(UniChar)wchar, 0};
+    UniChar unicharString[2];
+    int nuni;
+
+    if (CFStringGetSurrogatePairForLongCharacter(wchar, unicharString)) {
+	nuni = 2;
+    } else {
+	unicharString[0] = (UniChar) wchar;
+	nuni = 1;
+    }
 
     /* Get glyph and advance */
-    CGGlyph thisGlyphArray[1] = { 0 };
-    CGSize advances[1] = { { 0, 0 } };
+    CGGlyph thisGlyphArray[2] = { 0, 0 };
+    CGSize advances[2] = { { 0, 0 }, { 0, 0 } };
     CTFontGetGlyphsForCharacters(
-	(CTFontRef)font, unicharString, thisGlyphArray, 1);
+	(CTFontRef)font, unicharString, thisGlyphArray, nuni);
     CGGlyph glyph = thisGlyphArray[0];
     CTFontGetAdvancesForGlyphs(
 	(CTFontRef)font, kCTFontHorizontalOrientation, thisGlyphArray,
@@ -4845,55 +4853,187 @@ static errr Term_text_cocoa(int x, int y, int n, int a, const wchar_t *cp)
     return 0;
 }
 
-/*
- * From the Linux mbstowcs(3) man page:
- * If dest is NULL, n is ignored, and the conversion proceeds as above,
- * except that the converted wide characters are not written out to
- * memory, and that no length limit exists.
+/**
+ * Convert UTF-8 to UTF-32 with each UTF-32 stored in the native byte order as
+ * a wchar_t.  Return the total number of code points that would be generated
+ * by converting the UTF-8 input.
+ *
+ * \param dest Points to the buffer in which to store the conversion.  May be
+ * NULL.
+ * \param src Is a null-terminated UTF-8 sequence.
+ * \param n Is the maximum number of code points to store in dest.
+ *
+ * In case of malformed UTF-8, inserts a U+FFFD in the converted output at the
+ * point of the error.
  */
 static size_t Term_mbcs_cocoa(wchar_t *dest, const char *src, int n)
 {
-    int i;
-    int count = 0;
+    size_t nout = (n > 0) ? n : 0;
+    size_t count = 0;
 
-    /*
-     * Unicode code point to UTF-8
-     * 0x0000-0x007f:    0xxxxxxx
-     * 0x0080-0x07ff:    110xxxxx 10xxxxxx
-     * 0x0800-0xffff:    1110xxxx 10xxxxxx 10xxxxxx
-     * 0x10000-0x1fffff: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
-     * Note that UTF-16 limits Unicode to 0x10ffff. This code is not
-     * endian-agnostic.
-     */
-    for (i = 0; i < n || dest == NULL; i++) {
-        if ((src[i] & 0x80) == 0) {
-            if (dest != NULL) dest[count] = src[i];
-            if (src[i] == 0) break;
-        } else if ((src[i] & 0xe0) == 0xc0) {
-            if (dest != NULL) dest[count] =
-                            (((unsigned char)src[i] & 0x1f) << 6)|
-                            ((unsigned char)src[i+1] & 0x3f);
-            i++;
-        } else if ((src[i] & 0xf0) == 0xe0) {
-            if (dest != NULL) dest[count] =
-                            (((unsigned char)src[i] & 0x0f) << 12) |
-                            (((unsigned char)src[i+1] & 0x3f) << 6) |
-                            ((unsigned char)src[i+2] & 0x3f);
-            i += 2;
-        } else if ((src[i] & 0xf8) == 0xf0) {
-            if (dest != NULL) dest[count] =
-                            (((unsigned char)src[i] & 0x0f) << 18) |
-                            (((unsigned char)src[i+1] & 0x3f) << 12) |
-                            (((unsigned char)src[i+2] & 0x3f) << 6) |
-                            ((unsigned char)src[i+3] & 0x3f);
-            i += 3;
-        } else {
-            /* Found an invalid multibyte sequence */
-            return (size_t)-1;
-        }
-        count++;
+    while (1) {
+	/*
+	 * Default to U+FFFD to indicate an erroneous UTF-8 sequence that
+	 * could not be decoded.  Follow "best practice" recommended by the
+	 * Unicode 6 standard:  an erroneous sequence ends as soon as a
+	 * disallowed byte is encountered.
+         */
+	unsigned int decoded = 0xfffd;
+
+	if (((unsigned int) *src & 0x80) == 0) {
+            /* Encoded as single byte:  U+0000 to U+0007F -> 0xxxxxxx. */
+	    if (*src == 0) {
+		if (dest && count < nout) {
+                    dest[count] = 0;
+		}
+		break;
+	    }
+	    decoded = *src;
+	    ++src;
+	} else if (((unsigned int) *src & 0xe0) == 0xc0) {
+	    /* Encoded as two bytes:  U+0080 to U+07FF -> 110xxxxx 10xxxxxx. */
+	    unsigned int part = ((unsigned int) *src & 0x1f) << 6;
+
+	    ++src;
+	    /*
+	     * Check that the first two bits of the continuation byte are
+	     * valid and the encoding is not overlong.
+	     */
+	    if (((unsigned int) *src & 0xc0) == 0x80 && part > 0x40) {
+		decoded = part + ((unsigned int) *src & 0x3f);
+		++src;
+	    }
+	} else if (((unsigned int) *src & 0xf0) == 0xe0) {
+	    /*
+	     * Encoded as three bytes:  U+0800 to U+FFFF -> 1110xxxx 10xxxxxx
+	     * 10xxxxxx.
+	     */
+	    unsigned int part = ((unsigned int) *src & 0xf) << 12;
+
+	    ++src;
+	    if (((unsigned int) *src & 0xc0) == 0x80) {
+		part += ((unsigned int) *src & 0x3f) << 6;
+		++src;
+		/*
+		 * The second part of the test rejects overlong encodings.  The
+		 * third part rejects encodings of U+D800 to U+DFFF, reserved
+		 * for surrogate pairs.
+		 */
+		if (((unsigned int) *src & 0xc0) == 0x80 && part >= 0x800 &&
+			(part & 0xf800) != 0xd800) {
+		    decoded = part + ((unsigned int) *src & 0x3f);
+		    ++src;
+		}
+	    }
+	} else if (((unsigned int) *src & 0xf8) == 0xf0) {
+	    /*
+	     * Encoded as four bytes:  U+10000 to U+1FFFFF -> 11110xxx 10xxxxxx
+	     * 10xxxxxx 10xxxxxx.
+	     */
+	    unsigned int part = ((unsigned int) *src & 0x7) << 18;
+
+	    ++src;
+	    if (((unsigned int) *src & 0xc0) == 0x80) {
+		part += ((unsigned int) *src & 0x3f) << 12;
+		++src;
+		/*
+		 * The second part of the test rejects overlong encodings.
+		 * The third part rejects code points beyond U+10FFFF which
+		 * can't be encoded in UTF-16.
+		 */
+		if (((unsigned int) *src & 0xc0) == 0x80 && part >= 0x10000 &&
+			(part & 0xff0000) <= 0x100000) {
+		    part += ((unsigned int) *src & 0x3f) << 6;
+		    ++src;
+		    if (((unsigned int) *src & 0xc0) == 0x80) {
+			decoded = part + ((unsigned int) *src & 0x3f);
+			++src;
+		    }
+		}
+	    }
+	} else {
+	    /*
+	     * Either an impossible byte or one that signals the start of a
+	     * five byte or longer encoding.
+	     */
+	    ++src;
+	}
+	if (dest && count < nout) {
+	    dest[count] = decoded;
+	}
+	++count;
     }
     return count;
+}
+
+/**
+ * Convert a UTF-32 stored in the native byte order to UTF-8.
+ * \param s Points to the buffer where the conversion should be stored.
+ * That buffer must have at least Term_wcsz_cocoa() bytes.
+ * \param wchar Is the UTF-32 value to convert.
+ * \return The returned value is the number of bytes written to s or -1
+ * if the UTF-32 value could not be converted.
+ *
+ * This is a necessary counterpart to Term_mbcs_cocoa():  since we are
+ * overriding the default multibyte to wide character conversion, need to
+ * override the reverse conversion as well.
+ */
+static int Term_wctomb_cocoa(char *s, wchar_t wchar)
+{
+    if (wchar < 0) {
+        /* Refuse to encode something beyond the range encodeable by UTF-16. */
+        return -1;
+    }
+    if (wchar <= 0x7f) {
+        *s = wchar;
+        return 1;
+    }
+    if (wchar <= 0x7ff) {
+        *s++ = 0xc0 + (((unsigned int) wchar & 0x7c0) >> 6);
+        *s++ = 0x80 + ((unsigned int) wchar & 0x3f);
+        return 2;
+    }
+    if (wchar <= 0xffff) {
+        /* Refuse to encode a value reserved for surrogate pairs in UTF-16. */
+        if (wchar >= 0xd800 && wchar <= 0xdfff) {
+            return -1;
+        }
+        *s++ = 0xe0 + (((unsigned int) wchar & 0xf000) >> 12);
+        *s++ = 0x80 + (((unsigned int) wchar & 0xfc0) >> 6);
+        *s++ = 0x80 + ((unsigned int) wchar & 0x3f);
+        return 3;
+    }
+    if (wchar <= 0x10ffff) {
+        *s++ = 0xf0 + (((unsigned int) wchar & 0x1c0000) >> 18);
+        *s++ = 0x80 + (((unsigned int) wchar & 0x3f000) >> 12);
+        *s++ = 0x80 + (((unsigned int) wchar & 0xfc0) >> 6);
+        *s++ = 0x80 + ((unsigned int) wchar & 0x3f);
+        return 4;
+    }
+    /* Refuse to encode something beyond the range encodeable by UTF-16. */
+    return -1;
+}
+
+/**
+ * Return whether a UTF-32 value is printable.
+ *
+ * This is a necessary counterpart to Term_mbcs_cocoa() so that screening
+ * of wide characters in the core's text_out_to_screen() is consistent with
+ * what Term_mbcs_cocoa() does.
+ */
+static int Term_iswprint_cocoa(wint_t wc)
+{
+	return utf32_isprint((u32b) wc);
+}
+
+/**
+ * Return the maximum number of bytes needed for a multibyte encoding of a
+ * wchar.
+ */
+static int Term_wcsz_cocoa(void)
+{
+    /* UTF-8 takes at most 4 bytes to encode a Unicode code point. */
+    return 4;
 }
 
 /**
@@ -5144,10 +5284,26 @@ static BOOL send_event(NSEvent *event)
                 case NSBreakFunctionKey: ch = KC_BREAK; break;
                     
                 default:
-                    if (c <= 0x7F)
+                    if (c <= 0x7F) {
                         ch = (char)c;
-                    else
+                    } else if (c > 0x9f) {
+                        /*
+                         * It's beyond the range of the C1 control
+                         * characters.  Pass it on.
+                         */
+                        if (CFStringIsSurrogateHighCharacter(c)) {
+                            ch = CFStringGetLongCharacterForSurrogatePair(c,
+                                [[event characters] characterAtIndex:1]);
+                        } else {
+                            ch = c;
+                        }
+                    } else {
+                        /*
+                         * Exclude the control characters not caught by the
+                         * special cases.
+                         */
                         ch = '\0';
+                    }
                     break;
             }
             
@@ -5490,8 +5646,8 @@ static void load_prefs(void)
     }
 
     NSDictionary *defaults = [[NSDictionary alloc] initWithObjectsAndKeys:
-                              @"Menlo", @"FontName",
-                              [NSNumber numberWithFloat:13.f], @"FontSize",
+                              @"Menlo", @"FontName-0",
+                              [NSNumber numberWithFloat:13.f], @"FontSize-0",
                               [NSNumber numberWithInt:60], AngbandFrameRateDefaultsKey,
                               [NSNumber numberWithBool:YES], AngbandSoundDefaultsKey,
                               [NSNumber numberWithInt:GRAPHICS_NONE], AngbandGraphicsDefaultsKey,
@@ -5833,6 +5989,9 @@ static bool cocoa_get_file(const char *suggested_name, char *path, size_t len)
 	/* Prepare the windows */
 	init_windows();
 	text_mbcs_hook = Term_mbcs_cocoa;
+	text_wctomb_hook = Term_wctomb_cocoa;
+	text_wcsz_hook = Term_wcsz_cocoa;
+	text_iswprint_hook = Term_iswprint_cocoa;
 
 	/* Set up game event handlers */
 	init_display();
